@@ -12,6 +12,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+async def read_root():
+    return {"message": "Service is running!"}
+
 @app.websocket("/play")
 @app.websocket("/play/{room_id}")
 async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None)):
@@ -42,3 +46,4 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None))
 @app.on_event("startup")
 async def startup():
     import admin_commands
+

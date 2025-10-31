@@ -1,18 +1,42 @@
-import sys, os, importlib
-admin_path = "/etc/secrets/admin_commands.py"
-if os.path.exists(admin_path):
-    sys.path.append("/etc/secrets")
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+rooms = {}
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.websocket("/play")
+@app.websocket("/play/{room_id}")
+async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None)):
+    await ws.accept()
+    role = (role or "viewer").lower()
+    room = rooms.setdefault(room_id, {"players": [], "viewers": []})
+
+    if role in ("host", "client") and len(room["players"]) >= 2:
+        role = "viewer"
+
+    (room["players"] if role in ("host", "client") else room["viewers"]).append(ws)
+    print(f"[JOIN] {role} joined room {room_id}")
+
     try:
-        import types
-        spec = importlib.util.spec_from_file_location("admin_commands", admin_path)
-        admin_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(admin_module)
-        if hasattr(admin_module, "init_admin"):
-            admin_module.init_admin(app, rooms)
-        print("[ADMIN] admin_commands loaded successfully")
-    except Exception as e:
-        print("[ADMIN] Failed to load admin_commands:", e)
-else:
-    print("[ADMIN] admin_commands.py not found in /etc/secrets")
-
-
+        while True:
+            data = await ws.receive_text()
+            for p in room["players"] + room["viewers"]:
+                if p != ws:
+                    await p.send_text(data)
+    except:
+        pass
+    finally:
+        if ws in room["players"]:
+            room["players"].remove(ws)
+        elif ws in room["viewers"]:
+            room["viewers"].remove(ws)
+        if not room["players"] and not room["viewers"]:
+            del rooms[room_id]

@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -40,3 +40,4 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None))
             room["viewers"].remove(ws)
         if not room["players"] and not room["viewers"]:
             del rooms[room_id]
+

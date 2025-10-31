@@ -1,22 +1,42 @@
-from fastapi import FastAPI, WebSocket
-import json
+from fastapi import FastAPI, WebSocket, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 rooms = {}
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.websocket("/play/{room_id}")
-async def play(websocket: WebSocket, room_id: str):
-    await websocket.accept()
-    if room_id not in rooms:
-        rooms[room_id] = []
-    rooms[room_id].append(websocket)
+async def play(ws: WebSocket, room_id: str, role: str = Query(None)):
+    await ws.accept()
+    role = (role or "viewer").lower()
+    room = rooms.setdefault(room_id, {"players": [], "viewers": []})
+
+    if role in ("host", "client") and len(room["players"]) >= 2:
+        role = "viewer"
+
+    (room["players"] if role in ("host", "client") else room["viewers"]).append(ws)
+    print(f"[JOIN] {role} joined {room_id}")
+
     try:
         while True:
-            data = await websocket.receive_text()
-            for p in rooms[room_id]:
-                if p != websocket:
+            data = await ws.receive_text()
+            for p in room["players"] + room["viewers"]:
+                if p is not ws:
                     await p.send_text(data)
     except:
-        rooms[room_id].remove(websocket)
-        if not rooms[room_id]:
+        pass
+    finally:
+        if ws in room["players"]:
+            room["players"].remove(ws)
+        elif ws in room["viewers"]:
+            room["viewers"].remove(ws)
+        if not room["players"] and not room["viewers"]:
             del rooms[room_id]
+

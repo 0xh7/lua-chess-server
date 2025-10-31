@@ -1,5 +1,6 @@
-from fastapi import FastAPI, WebSocket, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+import secrets
 
 app = FastAPI()
 rooms = {}
@@ -14,26 +15,39 @@ app.add_middleware(
 
 @app.get("/")
 async def read_root():
-    return {"message": "Service is running!"}
+    return {"message": "Lua Chess Server is running securely"}
 
 @app.websocket("/play")
 @app.websocket("/play/{room_id}")
-async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None)):
+async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None), token: str = Query(None)):
     await ws.accept()
     role = (role or "viewer").lower()
-    room = rooms.setdefault(room_id, {"players": [], "viewers": []})
-
-    if role in ("host", "client") and len(room["players"]) >= 2:
-        role = "viewer"
-
-    (room["players"] if role in ("host", "client") else room["viewers"]).append(ws)
+    room = rooms.setdefault(room_id, {"players": [], "viewers": [], "tokens": {}})
+    if not token:
+        token = secrets.token_hex(8)
+        await ws.send_json({"token": token})
+    else:
+        room["tokens"][token] = role
+    if role in ("host", "client"):
+        if len(room["players"]) >= 2:
+            await ws.send_json({"error": "Room full"})
+            role = "viewer"
+        else:
+            room["players"].append(ws)
+            await ws.send_json({"role": role})
+    else:
+        room["viewers"].append(ws)
+        await ws.send_json({"role": "viewer"})
     try:
         while True:
             data = await ws.receive_text()
+            if '"move"' in data and role == "viewer":
+                await ws.send_json({"error": "Viewers cannot move"})
+                continue
             for p in room["players"] + room["viewers"]:
                 if p != ws:
                     await p.send_text(data)
-    except:
+    except WebSocketDisconnect:
         pass
     finally:
         if ws in room["players"]:
@@ -43,7 +57,6 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None))
         if not room["players"] and not room["viewers"]:
             del rooms[room_id]
 
-@app.on_event("startup")
-async def startup():
     import admin_commands
+
 

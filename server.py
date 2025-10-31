@@ -42,4 +42,3 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None))
 @app.on_event("startup")
 async def startup():
     import admin_commands
-

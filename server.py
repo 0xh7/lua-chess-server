@@ -1,7 +1,7 @@
-# server.py
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 import secrets
+import admin_commands
 
 app = FastAPI()
 rooms = {}
@@ -16,7 +16,7 @@ app.add_middleware(
 
 @app.get("/")
 async def read_root():
-    return {"message": "Lua Chess Server is running securely"}
+    return {"message": " Chess Server is running securely"}
 
 @app.websocket("/play")
 @app.websocket("/play/{room_id}")
@@ -68,8 +68,6 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None),
         if not room["players"] and not room["viewers"]:
             del rooms[room_id]
 
-@app.on_event("startup")
-async def startup():
-    import admin_commands
-    admin_commands.register_admin(app, rooms)
+admin_commands.init_admin_routes(app, rooms)
+
 

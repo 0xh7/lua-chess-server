@@ -12,8 +12,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.websocket("/play")
 @app.websocket("/play/{room_id}")
-async def play(ws: WebSocket, room_id: str, role: str = Query(None)):
+async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None)):
     await ws.accept()
     role = (role or "viewer").lower()
     room = rooms.setdefault(room_id, {"players": [], "viewers": []})
@@ -22,13 +23,13 @@ async def play(ws: WebSocket, room_id: str, role: str = Query(None)):
         role = "viewer"
 
     (room["players"] if role in ("host", "client") else room["viewers"]).append(ws)
-    print(f"[JOIN] {role} joined {room_id}")
+    print(f"[JOIN] {role} joined room {room_id}")
 
     try:
         while True:
             data = await ws.receive_text()
             for p in room["players"] + room["viewers"]:
-                if p is not ws:
+                if p != ws:
                     await p.send_text(data)
     except:
         pass
@@ -39,4 +40,5 @@ async def play(ws: WebSocket, room_id: str, role: str = Query(None)):
             room["viewers"].remove(ws)
         if not room["players"] and not room["viewers"]:
             del rooms[room_id]
+
 

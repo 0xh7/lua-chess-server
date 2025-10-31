@@ -1,12 +1,6 @@
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
-import sys
-
-sys.path.append("/etc/secrets")
-try:
-    import admin_commands
-except:
-    pass
+import sys, importlib
 
 app = FastAPI()
 rooms = {}
@@ -43,5 +37,12 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None))
             room["viewers"].remove(ws)
         if not room["players"] and not room["viewers"]:
             del rooms[room_id]
+
+sys.path.append("/etc/secrets")
+try:
+    import admin_commands
+    importlib.reload(admin_commands)
+except Exception as e:
+    print("Admin not lod:", e)
 
 

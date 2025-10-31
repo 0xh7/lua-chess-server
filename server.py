@@ -23,8 +23,6 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None))
         role = "viewer"
 
     (room["players"] if role in ("host", "client") else room["viewers"]).append(ws)
-    print(f"[JOIN] {role} joined room {room_id}")
-
     try:
         while True:
             data = await ws.receive_text()
@@ -43,4 +41,5 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None))
 
 @app.on_event("startup")
 async def startup():
-    import admin_commands    
+    import admin_commands
+

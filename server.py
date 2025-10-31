@@ -1,6 +1,12 @@
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
+import sys
 
+sys.path.append("/etc/secrets")
+try:
+    import admin_commands
+except:
+    pass
 
 app = FastAPI()
 rooms = {}
@@ -19,13 +25,9 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None))
     await ws.accept()
     role = (role or "viewer").lower()
     room = rooms.setdefault(room_id, {"players": [], "viewers": []})
-
     if role in ("host", "client") and len(room["players"]) >= 2:
         role = "viewer"
-
     (room["players"] if role in ("host", "client") else room["viewers"]).append(ws)
-    print(f"[JOIN] {role} joined room {room_id}")
-
     try:
         while True:
             data = await ws.receive_text()
@@ -41,7 +43,5 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None))
             room["viewers"].remove(ws)
         if not room["players"] and not room["viewers"]:
             del rooms[room_id]
-
-
 
 

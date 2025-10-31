@@ -41,3 +41,6 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None))
         if not room["players"] and not room["viewers"]:
             del rooms[room_id]
 
+@app.on_event("startup")
+async def startup():
+    import admin_commands    

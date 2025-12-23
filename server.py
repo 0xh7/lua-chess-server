@@ -1,23 +1,27 @@
-import os
-import json
-import secrets as _secrets
+
 from datetime import datetime
-from fastapi import Request, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
-from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi.middleware.cors import CORSMiddleware
+import secrets
+import admin_commands
 
-load_dotenv()
+app = FastAPI()
+rooms = {}
+admin_state = {"bans": {}}
 
-ADMIN_KEY = os.getenv("ADMIN_KEY")
-if not ADMIN_KEY:
-    raise RuntimeError("ADMIN_KEY is not set")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def _require_admin(request: Request):
-    key = request.headers.get("x-admin-key", "") or request.headers.get("X-Admin-Key", "")
-    if not key or not _secrets.compare_digest(key, ADMIN_KEY):
-        raise HTTPException(status_code=403, detail="Forbidden")
+@app.get("/")
+async def read_root():
+    return {"message": "Chess Server is running securely"}
 
-def _ws_ip(ws):
+def _client_ip(ws: WebSocket) -> str:
     xf = ws.headers.get("x-forwarded-for")
     if xf:
         return xf.split(",")[0].strip()
@@ -25,248 +29,68 @@ def _ws_ip(ws):
         return ws.client.host
     return "unknown"
 
-def _now_iso():
-    return datetime.utcnow().isoformat() + "Z"
+@app.websocket("/play")
+@app.websocket("/play/{room_id}")
+async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None), token: str = Query(None)):
+    ip = _client_ip(ws)
+    ua = ws.headers.get("user-agent", "unknown")
 
-def init_admin_routes(app, rooms, admin_state):
-    bans = admin_state.setdefault("bans", {})
+    if ip in admin_state["bans"]:
+        await ws.accept()
+        await ws.send_json({"error": "Banned"})
+        await ws.close(code=1008)
+        return
 
-    @app.get("/admin", response_class=HTMLResponse)
-    async def admin_panel():
-        return """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Chess Admin</title>
-<style>
-body{background:#0f172a;color:#e5e7eb;font-family:Arial;padding:20px}
-button{padding:10px 12px;margin:6px;background:#2563eb;color:white;border:none;border-radius:8px;cursor:pointer}
-button:hover{opacity:.92}
-input{padding:10px;margin:6px;border-radius:8px;border:1px solid #334155;background:#0b1220;color:#e5e7eb;width:340px;max-width:95%}
-pre{background:#020617;padding:12px;border-radius:10px;white-space:pre-wrap;word-break:break-word;border:1px solid #1e293b}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-</style>
-</head>
-<body>
-<h2>🛠 Chess Admin Panel</h2>
+    await ws.accept()
+    role = (role or "viewer").lower()
 
-<div class="row">
-  <input id="key" type="password" placeholder="ADMIN KEY">
-  <button onclick="rooms()">Rooms</button>
-  <button onclick="details()">Details</button>
-  <button onclick="broadcast()">Broadcast</button>
-  <button onclick="closeRoom()">Close Room</button>
-  <button onclick="banIp()">Ban IP</button>
-  <button onclick="unbanIp()">Unban IP</button>
-  <button onclick="bansList()">Bans</button>
-</div>
+    room = rooms.setdefault(room_id, {"players": [], "viewers": []})
+    connected_at = datetime.utcnow().isoformat() + "Z"
 
-<pre id="out"></pre>
+    if not token:
+        token = secrets.token_hex(16)
+        await ws.send_json({"token": token})
 
-<script>
-const out = document.getElementById("out");
+    entry = {"ws": ws, "token": token, "role": role, "ip": ip, "ua": ua, "connected_at": connected_at}
 
-function hdr(){
-  return {
-    "X-Admin-Key": document.getElementById("key").value,
-    "Content-Type": "application/json"
-  };
-}
+    if role in ("host", "client"):
+        if len(room["players"]) >= 2:
+            await ws.send_json({"error": "Room full"})
+            entry["role"] = "viewer"
+            room["viewers"].append(entry)
+            await ws.send_json({"role": "viewer"})
+        else:
+            room["players"].append(entry)
+            await ws.send_json({"role": role})
+    else:
+        entry["role"] = "viewer"
+        room["viewers"].append(entry)
+        await ws.send_json({"role": "viewer"})
 
-async function showResp(r){
-  const text = await r.text();
-  try{
-    const j = JSON.parse(text);
-    out.textContent = JSON.stringify(j, null, 2);
-  }catch{
-    out.textContent = text || ("HTTP " + r.status);
-  }
-}
+    try:
+        while True:
+            data = await ws.receive_text()
+            valid_tokens = {e["token"]: e["role"] for e in (room["players"] + room["viewers"])}
 
-async function rooms(){
-  const r = await fetch("/admin/rooms", {headers: hdr()});
-  await showResp(r);
-}
+            if token not in valid_tokens:
+                await ws.send_json({"error": "Invalid token"})
+                continue
 
-async function details(){
-  const r = await fetch("/admin/details", {headers: hdr()});
-  await showResp(r);
-}
+            sender_role = valid_tokens[token]
+            if '"move"' in data and sender_role not in ("host", "client"):
+                await ws.send_json({"error": "Not authorized to move"})
+                continue
 
-async function bansList(){
-  const r = await fetch("/admin/bans", {headers: hdr()});
-  await showResp(r);
-}
+            targets = [e["ws"] for e in (room["players"] + room["viewers"]) if e["ws"] is not ws]
+            for p in targets:
+                await p.send_text(data)
 
-async function broadcast(){
-  const msg = prompt("Message:");
-  if(!msg) return;
-  const r = await fetch("/admin/broadcast", {
-    method: "POST",
-    headers: hdr(),
-    body: JSON.stringify({message: msg})
-  });
-  await showResp(r);
-}
+    except WebSocketDisconnect:
+        pass
+    finally:
+        room["players"] = [e for e in room["players"] if e.get("ws") is not ws]
+        room["viewers"] = [e for e in room["viewers"] if e.get("ws") is not ws]
+        if not room["players"] and not room["viewers"]:
+            rooms.pop(room_id, None)
 
-async function closeRoom(){
-  const room = prompt("Room ID:");
-  if(!room) return;
-  const r = await fetch("/admin/close", {
-    method: "POST",
-    headers: hdr(),
-    body: JSON.stringify({room: room})
-  });
-  await showResp(r);
-}
-
-async function banIp(){
-  const ip = prompt("IP to ban:");
-  if(!ip) return;
-  const reason = prompt("Reason (optional):") || "";
-  const r = await fetch("/admin/ban", {
-    method: "POST",
-    headers: hdr(),
-    body: JSON.stringify({ip: ip, reason: reason})
-  });
-  await showResp(r);
-}
-
-async function unbanIp(){
-  const ip = prompt("IP to unban:");
-  if(!ip) return;
-  const r = await fetch("/admin/unban", {
-    method: "POST",
-    headers: hdr(),
-    body: JSON.stringify({ip: ip})
-  });
-  await showResp(r);
-}
-</script>
-</body>
-</html>
-"""
-
-    @app.get("/admin/rooms")
-    async def list_rooms(request: Request):
-        _require_admin(request)
-        return JSONResponse({
-            rid: {"players": len(r.get("players", [])), "viewers": len(r.get("viewers", []))}
-            for rid, r in rooms.items()
-        })
-
-    @app.get("/admin/details")
-    async def room_details(request: Request):
-        _require_admin(request)
-        data = {}
-        for rid, r in rooms.items():
-            players = []
-            viewers = []
-            for p in r.get("players", []):
-                ws = p.get("ws")
-                if ws:
-                    players.append({
-                        "ip": p.get("ip") or _ws_ip(ws),
-                        "ua": p.get("ua") or ws.headers.get("user-agent", "unknown"),
-                        "role": p.get("role"),
-                        "token": p.get("token"),
-                        "connected_at": p.get("connected_at") or ""
-                    })
-            for v in r.get("viewers", []):
-                ws = v.get("ws")
-                if ws:
-                    viewers.append({
-                        "ip": v.get("ip") or _ws_ip(ws),
-                        "ua": v.get("ua") or ws.headers.get("user-agent", "unknown"),
-                        "role": v.get("role"),
-                        "token": v.get("token"),
-                        "connected_at": v.get("connected_at") or ""
-                    })
-            data[rid] = {"players": players, "viewers": viewers}
-        return JSONResponse(data)
-
-    @app.get("/admin/bans")
-    async def list_bans(request: Request):
-        _require_admin(request)
-        return JSONResponse(bans)
-
-    @app.post("/admin/ban")
-    async def ban_ip(request: Request):
-        _require_admin(request)
-        body = await request.json()
-        ip = (body.get("ip") or "").strip()
-        reason = (body.get("reason") or "").strip()
-        if not ip:
-            raise HTTPException(status_code=400, detail="Missing ip")
-        bans[ip] = {"reason": reason, "at": _now_iso()}
-
-        closed = 0
-        for r in rooms.values():
-            for entry in (r.get("players", []) + r.get("viewers", [])):
-                eip = entry.get("ip") or (entry.get("ws") and _ws_ip(entry["ws"])) or "unknown"
-                if eip == ip:
-                    ws = entry.get("ws")
-                    if ws:
-                        try:
-                            await ws.send_text(json.dumps({"type": "system", "message": "Banned"}))
-                        except:
-                            pass
-                        try:
-                            await ws.close(code=1008)
-                            closed += 1
-                        except:
-                            pass
-        return JSONResponse({"banned": ip, "closed": closed})
-
-    @app.post("/admin/unban")
-    async def unban_ip(request: Request):
-        _require_admin(request)
-        body = await request.json()
-        ip = (body.get("ip") or "").strip()
-        if not ip:
-            raise HTTPException(status_code=400, detail="Missing ip")
-        existed = ip in bans
-        bans.pop(ip, None)
-        return JSONResponse({"unbanned": ip, "existed": existed})
-
-    @app.post("/admin/close")
-    async def close_room(request: Request):
-        _require_admin(request)
-        body = await request.json()
-        rid = body.get("room")
-        if not rid or rid not in rooms:
-            raise HTTPException(status_code=404, detail="Room not found")
-        entries = rooms[rid].get("players", []) + rooms[rid].get("viewers", [])
-        for entry in entries:
-            ws = entry.get("ws")
-            if ws:
-                try:
-                    await ws.close()
-                except:
-                    pass
-        rooms.pop(rid, None)
-        return JSONResponse({"closed": rid})
-
-    @app.post("/admin/broadcast")
-    async def broadcast(request: Request):
-        _require_admin(request)
-        body = await request.json()
-        msg = (body.get("message") or "").strip()
-        if not msg:
-            raise HTTPException(status_code=400, detail="No message provided")
-        if len(msg) > 500:
-            raise HTTPException(status_code=400, detail="Message too long")
-
-        payload = json.dumps({"type": "chat", "chat": f"[ADMIN]: {msg}", "message": f"[ADMIN]: {msg}"})
-        sent = 0
-        for r in rooms.values():
-            for entry in r.get("players", []) + r.get("viewers", []):
-                ws = entry.get("ws")
-                if ws:
-                    try:
-                        await ws.send_text(payload)
-                        sent += 1
-                    except:
-                        pass
-        return JSONResponse({"sent": sent, "message": msg})
+admin_commands.init_admin_routes(app, rooms, admin_state)

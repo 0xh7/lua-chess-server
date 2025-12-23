@@ -1,13 +1,14 @@
 
 from datetime import datetime
+import time
+import secrets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
-import secrets
 import admin_commands
 
 app = FastAPI()
 rooms = {}
-admin_state = {"bans": {}}
+admin_state = {"bans": {}, "room_locks": {}}
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,21 +30,46 @@ def _client_ip(ws: WebSocket) -> str:
         return ws.client.host
     return "unknown"
 
+def _is_banned(ip: str) -> bool:
+    bans = admin_state.setdefault("bans", {})
+    rec = bans.get(ip)
+    if not rec:
+        return False
+    until = rec.get("until", 0)
+    if until and time.time() > until:
+        bans.pop(ip, None)
+        return False
+    return True
+
+def _is_locked(room_id: str) -> bool:
+    locks = admin_state.setdefault("room_locks", {})
+    until = locks.get(room_id)
+    if not until:
+        return False
+    if time.time() > until:
+        locks.pop(room_id, None)
+        return False
+    return True
+
 @app.websocket("/play")
 @app.websocket("/play/{room_id}")
 async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None), token: str = Query(None)):
     ip = _client_ip(ws)
     ua = ws.headers.get("user-agent", "unknown")
 
-    if ip in admin_state["bans"]:
-        await ws.accept()
+    await ws.accept()
+
+    if _is_locked(room_id):
+        await ws.send_json({"error": "Room closed"})
+        await ws.close(code=1008)
+        return
+
+    if _is_banned(ip):
         await ws.send_json({"error": "Banned"})
         await ws.close(code=1008)
         return
 
-    await ws.accept()
     role = (role or "viewer").lower()
-
     room = rooms.setdefault(room_id, {"players": [], "viewers": []})
     connected_at = datetime.utcnow().isoformat() + "Z"
 
@@ -69,9 +95,14 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None),
 
     try:
         while True:
-            data = await ws.receive_text()
-            valid_tokens = {e["token"]: e["role"] for e in (room["players"] + room["viewers"])}
+            if _is_banned(ip):
+                await ws.send_json({"error": "Banned"})
+                await ws.close(code=1008)
+                return
 
+            data = await ws.receive_text()
+
+            valid_tokens = {e["token"]: e["role"] for e in (room["players"] + room["viewers"])}
             if token not in valid_tokens:
                 await ws.send_json({"error": "Invalid token"})
                 continue
@@ -83,7 +114,10 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None),
 
             targets = [e["ws"] for e in (room["players"] + room["viewers"]) if e["ws"] is not ws]
             for p in targets:
-                await p.send_text(data)
+                try:
+                    await p.send_text(data)
+                except Exception:
+                    pass
 
     except WebSocketDisconnect:
         pass

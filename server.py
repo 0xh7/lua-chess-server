@@ -1,7 +1,7 @@
-
 from datetime import datetime
-import time
+import json
 import secrets
+import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 import admin_commands
@@ -31,7 +31,7 @@ def _client_ip(ws: WebSocket) -> str:
     return "unknown"
 
 def _is_banned(ip: str) -> bool:
-    bans = admin_state.setdefault("bans", {})
+    bans = admin_state["bans"]
     rec = bans.get(ip)
     if not rec:
         return False
@@ -42,7 +42,7 @@ def _is_banned(ip: str) -> bool:
     return True
 
 def _is_locked(room_id: str) -> bool:
-    locks = admin_state.setdefault("room_locks", {})
+    locks = admin_state["room_locks"]
     until = locks.get(room_id)
     if not until:
         return False
@@ -50,6 +50,15 @@ def _is_locked(room_id: str) -> bool:
         locks.pop(room_id, None)
         return False
     return True
+
+def _room_entries(room: dict):
+    return room.get("players", []) + room.get("viewers", [])
+
+def _token_role_map(room: dict):
+    return {e.get("token"): e.get("role") for e in _room_entries(room) if e.get("token")}
+
+async def _send_json(ws: WebSocket, payload: dict):
+    await ws.send_text(json.dumps(payload, ensure_ascii=False))
 
 @app.websocket("/play")
 @app.websocket("/play/{room_id}")
@@ -60,66 +69,107 @@ async def play(ws: WebSocket, room_id: str = "default", role: str = Query(None),
     await ws.accept()
 
     if _is_locked(room_id):
-        await ws.send_json({"error": "Room closed"})
+        await _send_json(ws, {"type": "error", "error": "Room closed"})
         await ws.close(code=1008)
         return
 
     if _is_banned(ip):
-        await ws.send_json({"error": "Banned"})
+        await _send_json(ws, {"type": "error", "error": "Banned"})
         await ws.close(code=1008)
         return
 
     role = (role or "viewer").lower()
-    room = rooms.setdefault(room_id, {"players": [], "viewers": []})
-    connected_at = datetime.utcnow().isoformat() + "Z"
+    if role not in ("host", "client", "viewer"):
+        role = "viewer"
 
     if not token:
         token = secrets.token_hex(16)
-        await ws.send_json({"token": token})
+
+    room = rooms.setdefault(room_id, {"players": [], "viewers": []})
+    connected_at = datetime.utcnow().isoformat() + "Z"
 
     entry = {"ws": ws, "token": token, "role": role, "ip": ip, "ua": ua, "connected_at": connected_at}
 
     if role in ("host", "client"):
         if len(room["players"]) >= 2:
-            await ws.send_json({"error": "Room full"})
             entry["role"] = "viewer"
             room["viewers"].append(entry)
-            await ws.send_json({"role": "viewer"})
+            await _send_json(ws, {"type": "hello", "room": room_id, "role": "viewer", "token": token})
         else:
             room["players"].append(entry)
-            await ws.send_json({"role": role})
+            await _send_json(ws, {"type": "hello", "room": room_id, "role": role, "token": token})
     else:
         entry["role"] = "viewer"
         room["viewers"].append(entry)
-        await ws.send_json({"role": "viewer"})
+        await _send_json(ws, {"type": "hello", "room": room_id, "role": "viewer", "token": token})
 
     try:
         while True:
-            if _is_banned(ip):
-                await ws.send_json({"error": "Banned"})
+            if _is_locked(room_id):
+                await _send_json(ws, {"type": "error", "error": "Room closed"})
                 await ws.close(code=1008)
                 return
 
-            data = await ws.receive_text()
+            if _is_banned(ip):
+                await _send_json(ws, {"type": "error", "error": "Banned"})
+                await ws.close(code=1008)
+                return
 
-            valid_tokens = {e["token"]: e["role"] for e in (room["players"] + room["viewers"])}
-            if token not in valid_tokens:
-                await ws.send_json({"error": "Invalid token"})
+            raw = await ws.receive_text()
+            if not raw:
                 continue
 
-            sender_role = valid_tokens[token]
-            if '"move"' in data and sender_role not in ("host", "client"):
-                await ws.send_json({"error": "Not authorized to move"})
+            if len(raw) > 10000:
+                await _send_json(ws, {"type": "error", "error": "Message too large"})
                 continue
 
-            targets = [e["ws"] for e in (room["players"] + room["viewers"]) if e["ws"] is not ws]
-            for p in targets:
+            try:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    payload = {"type": "raw", "raw": raw}
+            except Exception:
+                payload = {"type": "raw", "raw": raw}
+
+            msg_type = (payload.get("type") or "").lower()
+            role_map = _token_role_map(room)
+            sender_role = role_map.get(token, entry.get("role"))
+
+            if msg_type == "move":
+                if sender_role not in ("host", "client"):
+                    await _send_json(ws, {"type": "error", "error": "Not authorized to move"})
+                    continue
+                uci = payload.get("uci") or payload.get("move")
+                if not uci:
+                    await _send_json(ws, {"type": "error", "error": "Missing uci"})
+                    continue
+                out = {"type": "move", "uci": str(uci), "from_token": token, "from_role": sender_role}
+            elif msg_type == "chat":
+                msg = payload.get("message")
+                if msg is None:
+                    msg = payload.get("chat")
+                if msg is None:
+                    msg = payload.get("text")
+                msg = "" if msg is None else str(msg)
+                msg = msg.strip()
+                if not msg:
+                    continue
+                if len(msg) > 800:
+                    await _send_json(ws, {"type": "error", "error": "Message too long"})
+                    continue
+                out = {"type": "chat", "message": msg, "from_token": token, "from_role": sender_role}
+            else:
+                out = {"type": "raw", "raw": raw, "from_token": token, "from_role": sender_role}
+
+            targets = [e["ws"] for e in _room_entries(room) if e.get("ws") is not ws]
+            for t in targets:
                 try:
-                    await p.send_text(data)
+                    await _send_json(t, out)
                 except Exception:
                     pass
 
     except WebSocketDisconnect:
+        pass
+    except Exception:
         pass
     finally:
         room["players"] = [e for e in room["players"] if e.get("ws") is not ws]

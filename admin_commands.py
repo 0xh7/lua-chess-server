@@ -1,4 +1,3 @@
-
 import os
 import secrets as _secrets
 from datetime import datetime
@@ -17,52 +16,32 @@ def _require_admin(request: Request):
     if not key or not _secrets.compare_digest(key, ADMIN_KEY):
         raise HTTPException(status_code=403, detail="Forbidden")
 
-def _ws_ip(ws):
-    xf = ws.headers.get("x-forwarded-for")
-    if xf:
-        return xf.split(",")[0].strip()
-    if getattr(ws, "client", None) and getattr(ws.client, "host", None):
-        return ws.client.host
-    return "unknown"
-
-def _ws_port(ws):
-    if getattr(ws, "client", None) and getattr(ws.client, "port", None):
-        return ws.client.port
-    return None
-
-def _now_iso():
-    return datetime.utcnow().isoformat() + "Z"
-
-def _entry_ip(entry):
-    ip = entry.get("ip")
-    if ip:
-        return ip
-    ws = entry.get("ws")
-    return _ws_ip(ws) if ws else "unknown"
-
-def _entry_ua(entry):
-    ua = entry.get("ua")
-    if ua:
-        return ua
-    ws = entry.get("ws")
-    if ws:
-        return ws.headers.get("user-agent", "unknown")
-    return "unknown"
-
-def _entry_details(entry, kind):
-    ws = entry.get("ws")
-    return {
-        "token": entry.get("token"),
-        "role": entry.get("role"),
-        "kind": kind,
-        "ip": _entry_ip(entry),
-        "port": _ws_port(ws) if ws else None,
-        "ua": _entry_ua(entry),
-        "connected_at": entry.get("connected_at") or "",
-    }
-
 def init_admin_routes(app, rooms, admin_state):
     bans = admin_state.setdefault("bans", {})
+
+    def _entry_ip(entry):
+        ip = entry.get("ip")
+        if ip:
+            return ip
+        ws = entry.get("ws")
+        if ws:
+            xf = ws.headers.get("x-forwarded-for")
+            if xf:
+                return xf.split(",")[0].strip()
+            if getattr(ws, "client", None) and getattr(ws.client, "host", None):
+                return ws.client.host
+        return "unknown"
+
+    async def _kick_by_ip(ip: str):
+        for r in rooms.values():
+            for entry in (r.get("players", []) + r.get("viewers", [])):
+                if _entry_ip(entry) == ip:
+                    ws = entry.get("ws")
+                    if ws:
+                        try:
+                            await ws.close(code=1008)
+                        except:
+                            pass
 
     @app.get("/admin", response_class=HTMLResponse)
     async def admin_panel():
@@ -93,7 +72,13 @@ pre{background:#020617;padding:12px;border-radius:10px;white-space:pre-wrap;word
   <button onclick="closeRoom()">Close Room</button>
 </div>
 
-<div class="small">lol   .env/Secret Files.</div>
+<div class="row">
+  <button onclick="bans()">Bans</button>
+  <button onclick="banIp()">Ban IP</button>
+  <button onclick="unbanIp()">Unban IP</button>
+</div>
+
+<div class="small">Secret: ADMIN_KEY</div>
 
 <pre id="out"></pre>
 
@@ -148,6 +133,33 @@ async function closeRoom(){
   });
   await showResp(r);
 }
+
+async function bans(){
+  const r = await fetch("/admin/bans", {headers: hdr()});
+  await showResp(r);
+}
+
+async function banIp(){
+  const ip = prompt("IP to ban:");
+  if(!ip) return;
+  const r = await fetch("/admin/ban", {
+    method: "POST",
+    headers: hdr(),
+    body: JSON.stringify({ip: ip})
+  });
+  await showResp(r);
+}
+
+async function unbanIp(){
+  const ip = prompt("IP to unban:");
+  if(!ip) return;
+  const r = await fetch("/admin/unban", {
+    method: "POST",
+    headers: hdr(),
+    body: JSON.stringify({ip: ip})
+  });
+  await showResp(r);
+}
 </script>
 </body>
 </html>
@@ -169,27 +181,21 @@ async function closeRoom(){
             players = []
             viewers = []
             for p in r.get("players", []):
-                ws = p.get("ws")
-                if ws:
-                    players.append({
-                        "ip": _ws_ip(ws),
-                        "port": _ws_port(ws),
-                        "ua": ws.headers.get("user-agent", "unknown"),
-                        "role": p.get("role")
-                    })
-                else:
-                    players.append({"unknown": True})
+                players.append({
+                    "ip": _entry_ip(p),
+                    "ua": (p.get("ua") or (p.get("ws").headers.get("user-agent", "unknown") if p.get("ws") else "unknown")),
+                    "role": p.get("role"),
+                    "token": p.get("token"),
+                    "connected_at": p.get("connected_at", "")
+                })
             for v in r.get("viewers", []):
-                ws = v.get("ws")
-                if ws:
-                    viewers.append({
-                        "ip": _ws_ip(ws),
-                        "port": _ws_port(ws),
-                        "ua": ws.headers.get("user-agent", "unknown"),
-                        "role": v.get("role")
-                    })
-                else:
-                    viewers.append({"unknown": True})
+                viewers.append({
+                    "ip": _entry_ip(v),
+                    "ua": (v.get("ua") or (v.get("ws").headers.get("user-agent", "unknown") if v.get("ws") else "unknown")),
+                    "role": v.get("role"),
+                    "token": v.get("token"),
+                    "connected_at": v.get("connected_at", "")
+                })
             data[rid] = {"players": players, "viewers": viewers}
         return JSONResponse(data)
 
@@ -197,37 +203,4 @@ async function closeRoom(){
     async def close_room(request: Request):
         _require_admin(request)
         body = await request.json()
-        rid = body.get("room")
-        if not rid or rid not in rooms:
-            raise HTTPException(status_code=404, detail="Room not found")
-        entries = rooms[rid].get("players", []) + rooms[rid].get("viewers", [])
-        for entry in entries:
-            ws = entry.get("ws")
-            if ws:
-                try:
-                    await ws.close()
-                except:
-                    pass
-        rooms.pop(rid, None)
-        return JSONResponse({"closed": rid})
 
-    @app.post("/admin/broadcast")
-    async def broadcast(request: Request):
-        _require_admin(request)
-        body = await request.json()
-        msg = (body.get("message") or "").strip()
-        if not msg:
-            raise HTTPException(status_code=400, detail="No message provided")
-        if len(msg) > 500:
-            raise HTTPException(status_code=400, detail="Message too long")
-        sent = 0
-        for r in rooms.values():
-            for entry in r.get("players", []) + r.get("viewers", []):
-                ws = entry.get("ws")
-                if ws:
-                    try:
-                        await ws.send_text(f"[ADMIN]: {msg}")
-                        sent += 1
-                    except:
-                        pass
-        return JSONResponse({"message": msg, "sent": sent})

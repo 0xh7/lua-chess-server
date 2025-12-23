@@ -1,35 +1,87 @@
+# admin_commands.py
 import os
+import time
 import json
 import secrets as _secrets
-from datetime import datetime
 from fastapi import Request, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from dotenv import load_dotenv
 
 load_dotenv()
 
-ADMIN_KEY = os.getenv("ADMIN_KEY")
+def _read_secret_file(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+            return v or None
+    except Exception:
+        return None
+
+ADMIN_KEY = os.getenv("ADMIN_KEY") or _read_secret_file("/etc/secrets/ADMIN_KEY") or _read_secret_file("./ADMIN_KEY")
 if not ADMIN_KEY:
     raise RuntimeError("ADMIN_KEY is not set")
 
 def _require_admin(request: Request):
-    key = request.headers.get("x-admin-key", "") or request.headers.get("X-Admin-Key", "")
+    key = request.headers.get("x-admin-key", "")
     if not key or not _secrets.compare_digest(key, ADMIN_KEY):
         raise HTTPException(status_code=403, detail="Forbidden")
 
-def _ws_ip(ws):
-    xf = ws.headers.get("x-forwarded-for")
-    if xf:
-        return xf.split(",")[0].strip()
-    if getattr(ws, "client", None) and getattr(ws.client, "host", None):
-        return ws.client.host
-    return "unknown"
-
-def _now_iso():
-    return datetime.utcnow().isoformat() + "Z"
-
 def init_admin_routes(app, rooms, admin_state):
     bans = admin_state.setdefault("bans", {})
+    room_locks = admin_state.setdefault("room_locks", {})
+
+    def _ban_is_active(ip: str) -> bool:
+        rec = bans.get(ip)
+        if not rec:
+            return False
+        until = rec.get("until", 0)
+        if until and time.time() > until:
+            bans.pop(ip, None)
+            return False
+        return True
+
+    def _find_ip_by_token(token: str) -> str | None:
+        for r in rooms.values():
+            for e in r.get("players", []) + r.get("viewers", []):
+                if e.get("token") == token:
+                    return e.get("ip")
+        return None
+
+    async def _kick_ip(ip: str) -> int:
+        kicked = 0
+        empty_rooms = []
+        for rid, r in rooms.items():
+            remaining_players = []
+            remaining_viewers = []
+            for e in r.get("players", []):
+                if e.get("ip") == ip:
+                    ws = e.get("ws")
+                    if ws:
+                        try:
+                            await ws.close(code=1008)
+                        except Exception:
+                            pass
+                    kicked += 1
+                else:
+                    remaining_players.append(e)
+            for e in r.get("viewers", []):
+                if e.get("ip") == ip:
+                    ws = e.get("ws")
+                    if ws:
+                        try:
+                            await ws.close(code=1008)
+                        except Exception:
+                            pass
+                    kicked += 1
+                else:
+                    remaining_viewers.append(e)
+            r["players"] = remaining_players
+            r["viewers"] = remaining_viewers
+            if not r["players"] and not r["viewers"]:
+                empty_rooms.append(rid)
+        for rid in empty_rooms:
+            rooms.pop(rid, None)
+        return kicked
 
     @app.get("/admin", response_class=HTMLResponse)
     async def admin_panel():
@@ -43,9 +95,10 @@ def init_admin_routes(app, rooms, admin_state):
 body{background:#0f172a;color:#e5e7eb;font-family:Arial;padding:20px}
 button{padding:10px 12px;margin:6px;background:#2563eb;color:white;border:none;border-radius:8px;cursor:pointer}
 button:hover{opacity:.92}
-input{padding:10px;margin:6px;border-radius:8px;border:1px solid #334155;background:#0b1220;color:#e5e7eb;width:340px;max-width:95%}
+input{padding:10px;margin:6px;border-radius:8px;border:1px solid #334155;background:#0b1220;color:#e5e7eb;width:360px;max-width:95%}
 pre{background:#020617;padding:12px;border-radius:10px;white-space:pre-wrap;word-break:break-word;border:1px solid #1e293b}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.small{opacity:.8;font-size:13px;margin-top:6px}
 </style>
 </head>
 <body>
@@ -59,8 +112,10 @@ pre{background:#020617;padding:12px;border-radius:10px;white-space:pre-wrap;word
   <button onclick="closeRoom()">Close Room</button>
   <button onclick="banIp()">Ban IP</button>
   <button onclick="unbanIp()">Unban IP</button>
-  <button onclick="bansList()">Bans</button>
+  <button onclick="bans()">Bans</button>
 </div>
+
+<div class="small">Use ADMIN_KEY from env/Render secrets.</div>
 
 <pre id="out"></pre>
 
@@ -85,63 +140,66 @@ async function showResp(r){
 }
 
 async function rooms(){
-  const r = await fetch("/admin/rooms", {headers: hdr()});
-  await showResp(r);
+  await showResp(await fetch("/admin/rooms", {headers: hdr()}));
 }
 
 async function details(){
-  const r = await fetch("/admin/details", {headers: hdr()});
-  await showResp(r);
+  await showResp(await fetch("/admin/details", {headers: hdr()}));
 }
 
-async function bansList(){
-  const r = await fetch("/admin/bans", {headers: hdr()});
-  await showResp(r);
+async function bans(){
+  await showResp(await fetch("/admin/bans", {headers: hdr()}));
 }
 
 async function broadcast(){
   const msg = prompt("Message:");
   if(!msg) return;
-  const r = await fetch("/admin/broadcast", {
+  await showResp(await fetch("/admin/broadcast", {
     method: "POST",
     headers: hdr(),
     body: JSON.stringify({message: msg})
-  });
-  await showResp(r);
+  }));
 }
 
 async function closeRoom(){
   const room = prompt("Room ID:");
   if(!room) return;
-  const r = await fetch("/admin/close", {
+  const secs = prompt("Lock seconds (default 300):");
+  const lock_seconds = secs ? parseInt(secs,10) : 300;
+  await showResp(await fetch("/admin/close", {
     method: "POST",
     headers: hdr(),
-    body: JSON.stringify({room: room})
-  });
-  await showResp(r);
+    body: JSON.stringify({room: room, lock_seconds})
+  }));
 }
 
 async function banIp(){
-  const ip = prompt("IP to ban:");
-  if(!ip) return;
-  const reason = prompt("Reason (optional):") || "";
-  const r = await fetch("/admin/ban", {
+  const ip = prompt("IP (or leave empty to ban by token):");
+  let payload = {};
+  if(ip){
+    payload.ip = ip.trim();
+  }else{
+    const token = prompt("Token:");
+    if(!token) return;
+    payload.token = token.trim();
+  }
+  const secs = prompt("Ban seconds (0 = permanent):");
+  payload.seconds = secs ? parseInt(secs,10) : 0;
+  await showResp(await fetch("/admin/ban", {
     method: "POST",
     headers: hdr(),
-    body: JSON.stringify({ip: ip, reason: reason})
-  });
-  await showResp(r);
+    body: JSON.stringify(payload)
+  }));
 }
 
 async function unbanIp(){
-  const ip = prompt("IP to unban:");
+  const ip = prompt("IP:");
   if(!ip) return;
-  const r = await fetch("/admin/unban", {
+  await showResp(await fetch("/admin/unban", {
     method: "POST",
     headers: hdr(),
-    body: JSON.stringify({ip: ip})
-  });
-  await showResp(r);
+    body: JSON.stringify({ip: ip.trim()})
+  }));
 }
 </script>
 </body>
@@ -151,8 +209,13 @@ async function unbanIp(){
     @app.get("/admin/rooms")
     async def list_rooms(request: Request):
         _require_admin(request)
+        now = time.time()
         return JSONResponse({
-            rid: {"players": len(r.get("players", [])), "viewers": len(r.get("viewers", []))}
+            rid: {
+                "players": len(r.get("players", [])),
+                "viewers": len(r.get("viewers", [])),
+                "locked": bool(room_locks.get(rid, 0) > now)
+            }
             for rid, r in rooms.items()
         })
 
@@ -164,89 +227,36 @@ async function unbanIp(){
             players = []
             viewers = []
             for p in r.get("players", []):
-                ws = p.get("ws")
-                if ws:
-                    players.append({
-                        "ip": p.get("ip") or _ws_ip(ws),
-                        "ua": p.get("ua") or ws.headers.get("user-agent", "unknown"),
-                        "role": p.get("role"),
-                        "token": p.get("token"),
-                        "connected_at": p.get("connected_at") or ""
-                    })
+                players.append({
+                    "token": p.get("token"),
+                    "ip": p.get("ip"),
+                    "ua": p.get("ua"),
+                    "role": p.get("role"),
+                    "connected_at": p.get("connected_at")
+                })
             for v in r.get("viewers", []):
-                ws = v.get("ws")
-                if ws:
-                    viewers.append({
-                        "ip": v.get("ip") or _ws_ip(ws),
-                        "ua": v.get("ua") or ws.headers.get("user-agent", "unknown"),
-                        "role": v.get("role"),
-                        "token": v.get("token"),
-                        "connected_at": v.get("connected_at") or ""
-                    })
+                viewers.append({
+                    "token": v.get("token"),
+                    "ip": v.get("ip"),
+                    "ua": v.get("ua"),
+                    "role": v.get("role"),
+                    "connected_at": v.get("connected_at")
+                })
             data[rid] = {"players": players, "viewers": viewers}
         return JSONResponse(data)
 
     @app.get("/admin/bans")
     async def list_bans(request: Request):
         _require_admin(request)
-        return JSONResponse(bans)
-
-    @app.post("/admin/ban")
-    async def ban_ip(request: Request):
-        _require_admin(request)
-        body = await request.json()
-        ip = (body.get("ip") or "").strip()
-        reason = (body.get("reason") or "").strip()
-        if not ip:
-            raise HTTPException(status_code=400, detail="Missing ip")
-        bans[ip] = {"reason": reason, "at": _now_iso()}
-
-        closed = 0
-        for r in rooms.values():
-            for entry in (r.get("players", []) + r.get("viewers", [])):
-                eip = entry.get("ip") or (entry.get("ws") and _ws_ip(entry["ws"])) or "unknown"
-                if eip == ip:
-                    ws = entry.get("ws")
-                    if ws:
-                        try:
-                            await ws.send_text(json.dumps({"type": "system", "message": "Banned"}))
-                        except:
-                            pass
-                        try:
-                            await ws.close(code=1008)
-                            closed += 1
-                        except:
-                            pass
-        return JSONResponse({"banned": ip, "closed": closed})
-
-    @app.post("/admin/unban")
-    async def unban_ip(request: Request):
-        _require_admin(request)
-        body = await request.json()
-        ip = (body.get("ip") or "").strip()
-        if not ip:
-            raise HTTPException(status_code=400, detail="Missing ip")
-        existed = ip in bans
-        bans.pop(ip, None)
-        return JSONResponse({"unbanned": ip, "existed": existed})
-
-    @app.post("/admin/close")
-    async def close_room(request: Request):
-        _require_admin(request)
-        body = await request.json()
-        rid = body.get("room")
-        if not rid or rid not in rooms:
-            raise HTTPException(status_code=404, detail="Room not found")
-        entries = rooms[rid].get("players", []) + rooms[rid].get("viewers", [])
-        for entry in entries:
-            ws = entry.get("ws")
-            if ws:
-                try:
-                    await ws.close()
-                except:
-                    pass
-        rooms.pop(rid, None)
-        return JSONResponse({"closed": rid})
+        now = time.time()
+        out = {}
+        for ip, rec in list(bans.items()):
+            until = rec.get("until", 0)
+            if until and now > until:
+                bans.pop(ip, None)
+                continue
+            out[ip] = {"until": until, "seconds_left": int(until - now) if until else 0}
+        return JSONResponse(out)
 
     @app.post("/admin/broadcast")
     async def broadcast(request: Request):
@@ -258,15 +268,68 @@ async function unbanIp(){
         if len(msg) > 500:
             raise HTTPException(status_code=400, detail="Message too long")
 
-        payload = json.dumps({"type": "chat", "chat": f"[ADMIN]: {msg}", "message": f"[ADMIN]: {msg}"})
+        payload = json.dumps({"type": "chat", "message": msg, "from": "admin"})
         sent = 0
         for r in rooms.values():
-            for entry in r.get("players", []) + r.get("viewers", []):
-                ws = entry.get("ws")
+            for e in r.get("players", []) + r.get("viewers", []):
+                ws = e.get("ws")
                 if ws:
                     try:
                         await ws.send_text(payload)
                         sent += 1
-                    except:
+                    except Exception:
                         pass
-        return JSONResponse({"sent": sent, "message": msg})
+        return JSONResponse({"sent": sent})
+
+    @app.post("/admin/close")
+    async def close_room(request: Request):
+        _require_admin(request)
+        body = await request.json()
+        rid = body.get("room")
+        lock_seconds = int(body.get("lock_seconds") or 300)
+        if not rid or rid not in rooms:
+            raise HTTPException(status_code=404, detail="Room not found")
+
+        entries = rooms[rid].get("players", []) + rooms[rid].get("viewers", [])
+        for e in entries:
+            ws = e.get("ws")
+            if ws:
+                try:
+                    await ws.close(code=1001)
+                except Exception:
+                    pass
+
+        rooms.pop(rid, None)
+        if lock_seconds > 0:
+            room_locks[rid] = time.time() + lock_seconds
+
+        return JSONResponse({"closed": rid, "locked_seconds": lock_seconds})
+
+    @app.post("/admin/ban")
+    async def ban(request: Request):
+        _require_admin(request)
+        body = await request.json()
+        ip = (body.get("ip") or "").strip()
+        token = (body.get("token") or "").strip()
+        seconds = int(body.get("seconds") or 0)
+
+        if not ip and token:
+            ip = _find_ip_by_token(token) or ""
+        if not ip:
+            raise HTTPException(status_code=400, detail="Provide ip or token")
+
+        until = time.time() + seconds if seconds > 0 else 0
+        bans[ip] = {"until": until}
+
+        kicked = await _kick_ip(ip)
+        return JSONResponse({"banned": ip, "kicked": kicked, "seconds": seconds})
+
+    @app.post("/admin/unban")
+    async def unban(request: Request):
+        _require_admin(request)
+        body = await request.json()
+        ip = (body.get("ip") or "").strip()
+        if not ip:
+            raise HTTPException(status_code=400, detail="Provide ip")
+        bans.pop(ip, None)
+        return JSONResponse({"unbanned": ip})
